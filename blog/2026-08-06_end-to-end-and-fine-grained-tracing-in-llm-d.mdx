@@ -2,7 +2,7 @@
 title: "Seeing Through the Stack: End-to-End and Fine-Grained Tracing in llm-d"
 description: "How llm-d stitches Gateway, EPP, KV-cache, P/D proxy, and vLLM into one OpenTelemetry trace, and instruments the scheduling decisions that metrics alone cannot explain."
 slug: end-to-end-and-fine-grained-tracing-in-llm-d
-date: 2026-08-06T09:00
+date: 2026-08-26T09:00
 
 authors:
   - gyliu513
@@ -45,7 +45,7 @@ Together they move observability from “the cluster looks busy” to “this re
 
 ## Why LLM inference breaks classical “just add APM” advice
 
-Kubernetes-era APM habits assume relatively uniform microservices: short RPCs, similar cost per call, cheap retries. Distributed LLM inference violates those assumptions in ways that change what must be instrumented:
+Kubernetes-era Application Performance Monitoring (APM) habits assume relatively uniform microservices: short RPCs, similar cost per call, cheap retries. Distributed LLM inference violates those assumptions in ways that change what must be instrumented:
 
 | Classical microservice | Distributed LLM inference (llm-d) |
 | :--- | :--- |
@@ -107,7 +107,9 @@ Debate about “network vs GPU” becomes secondary until the waterfall has iden
 
 ### 2. Did KV-cache-aware routing actually help?
 
-Fleet-level cache hit rate can look healthy while a slice of traffic is still routed poorly. Fine-grained spans expose candidate endpoints, score distributions, and block hit ratios for *that* request. Which spans appear depends on how routing is configured: scorer-based setups emit `llm_d.epp.scoring` with one `llm_d.epp.scorer.<scorer type>` child per scorer, carrying `llm_d.epp.scorer.score.max` / `.avg` and `llm_d.epp.scorer.endpoints_scored`. The precise prefix-cache path adds `produce_precise_prefix_cache` (`llm_d.epp.producer.total_blocks`, `.max_match_blocks`) over a `llm_d.kv_cache.index` lookup (`llm_d.kv_cache.lookup.cache_hit`, `.blocks_found`). Prefix affinity there is not a scorer, so it appears as `prefix-cache-affinity-filter` shrinking the pool under `filter_endpoints`, while any scorers you also configure keep emitting their own `llm_d.epp.scoring` subtree next to it. On a warm repeat of a shared prefix, that subtree is where the hit becomes visible: in a capture on a two-pod deployment, the producer reported `max_match_blocks` equal to `total_blocks` at 13 of 13, the lookup reported `cache_hit=true`, and `filter_endpoints` narrowed two candidates to the single pod already holding those blocks. That is how precise prefix-cache scheduling is validated in production, in the same spirit as the wins in the [KV-cache blog](/blog/kvcache-wins-you-can-see), but request-scoped.
+Fleet-level cache hit rate can look healthy while a slice of traffic is still routed poorly. Fine-grained spans expose candidate endpoints, score distributions, and block hit ratios for *that* request. Which spans appear depends on how routing is configured: scorer-based setups emit `scoring` with one `scorer.<scorer type>` child per scorer, carrying `llm_d.epp.scorer.score.max` / `.avg` and `llm_d.epp.scorer.endpoints_scored` as attributes. The precise prefix-cache path adds `produce_precise_prefix_cache` (`llm_d.epp.producer.total_blocks`, `.max_match_blocks`) over an `index_lookup` (`llm_d.kv_cache.lookup.cache_hit`, `.blocks_found`). Prefix affinity there is not a scorer, so it appears as `prefix-cache-affinity-filter` shrinking the pool under `filter_endpoints`, while any scorers you also configure keep emitting their own `scoring` subtree next to it. On a warm repeat of a shared prefix, that subtree is where the hit becomes visible: in a capture on a two-pod deployment, the producer reported `max_match_blocks` equal to `total_blocks` at 13 of 13, the lookup reported `cache_hit=true`, and `filter_endpoints` narrowed two candidates to the single pod already holding those blocks. That is how precise prefix-cache scheduling is validated in production, in the same spirit as the wins in the [KV-cache blog](/blog/kvcache-wins-you-can-see), but request-scoped.
+
+The affinity filter's own routing decision (sticky to the cache-affine pod, no match, overridden by load, or skipped for exploration) is captured today as the `llm_d_epp_prefix_cache_affinity_filter_decisions_total` metric, labeled by outcome, not yet as a span; a fine-grained span for it is tracked in [llm-d-router#2539](https://github.com/llm-d/llm-d-router/issues/2539).
 
 ### 3. Was P/D the right call?
 
@@ -141,10 +143,10 @@ Sampling is **parent-based ratio** (`parentbased_traceidratio`), the only sample
 
 | Layer | Span role | What to inspect |
 | :--- | :--- | :--- |
-| **Gateway** | `gateway.request` (SERVER): the root when the gateway's own tracing is off, otherwise a child of the gateway's span; injects `traceparent` / `tracestate` | Total e2e time; whether context reached children |
-| **EPP plugins** | `gateway.request_orchestration` over scoring, profile pick, and pre-request spans | Why an endpoint / mode was chosen |
-| **KV-cache** | `llm_d.kv_cache.index` lookups on the request path, `.add` when speculative indexing records the request's own blocks, `.evict` from KV-event processing; emitted inside the EPP process, so they carry the EPP service name in Jaeger | Block hits, lookup cost, index churn |
-| **P/D proxy** | `llm_d.pd_proxy.<METHOD> <path>` (otelhttp) → `forward_request` → conditional prefill/decode children | Stage timing, connector, skip reasons |
+| **Gateway** | `request` (SERVER): the root when the gateway's own tracing is off, otherwise a child of the gateway's span; injects `traceparent` / `tracestate` | Total e2e time; whether context reached children |
+| **EPP plugins** | `request_orchestration` over scoring, profile pick, and pre-request spans | Why an endpoint / mode was chosen |
+| **KV-cache** | `index_lookup` on the request path, `index_add` when speculative indexing records the request's own blocks, `index_evict` from KV-event processing; emitted inside the EPP process, so they carry the EPP service name in Jaeger; attributes keep the `llm_d.kv_cache.*` prefix even though the span names no longer do | Block hits, lookup cost, index churn |
+| **P/D proxy** | `<METHOD> <path>` (otelhttp) → `forward_request` → conditional prefill/decode children | Stage timing, connector, skip reasons |
 | **vLLM (or peer engine)** | Continued `llm_request` with GenAI attributes | Prefill/decode time, TTFT, token usage |
 
 ```mermaid
@@ -156,7 +158,7 @@ sequenceDiagram
   participant V as vLLM
 
   C->>G: request (+ optional parent traceparent)
-  Note over G: Start gateway.request<br/>parent-based sample once
+  Note over G: Start request<br/>parent-based sample once
   G->>K: score / lookup (same trace context)
   K-->>G: scores / hit info
   G->>P: forward + inject W3C headers
@@ -213,26 +215,26 @@ E2E alone can still leave a fat opaque span inside the scheduler. Fine-grained t
 
 | Span | Insight |
 | :--- | :--- |
-| `gateway.request_orchestration` | The EPP-side envelope every decision span hangs from |
+| `request_orchestration` | The EPP-side envelope every decision span hangs from |
 | `filter_endpoints` / `pick_endpoints` | Candidate set before and after filters; top endpoints and scores |
-| `llm_d.epp.scoring` → `llm_d.epp.scorer.<scorer type>` | Endpoints scored, score max/avg, scorer name and weight |
+| `scoring` → `scorer.<scorer type>` | Endpoints scored, score max/avg, scorer name and weight |
 | `produce_precise_prefix_cache` | Resident-block match for the request (`total_blocks`, `max_match_blocks`) |
-| `llm_d.kv_cache.index` / `.add` / `.evict` | Lookup and speculative add on the request path; eviction from KV-event processing |
+| `index_lookup` / `index_add` / `index_evict` | Lookup and speculative add on the request path; eviction from KV-event processing |
 | `pick_disagg_profile` | Per-stage disaggregation decision (`run_prefill`, `complete_decode-only`, …) |
 | `prepare_disaggregation` | Whether prefill / encode headers were set for the proxy |
-| `llm_d.pd_proxy.<METHOD> <path>` → `forward_request` → `prefill` / `decode` | Stage timing, connector, targets, skip reasons |
+| `<METHOD> <path>` → `forward_request` → `prefill` / `decode` | Stage timing, connector, targets, skip reasons |
 | `llm_request` (vLLM) | Engine TTFT, phase times, token usage |
 
-Two naming details are worth knowing before searching Jaeger. The scorer span uses the plugin *type*, not its instance name, so a profile that configures the same scorer twice produces two identically-named spans separated only by `llm_d.epp.scorer.name`. And the proxy's stage spans are bare `prefill` / `decode` on the default `nixlv2` connector; the `llm_d.pd_proxy.`-prefixed variants come from the `p2p` and `mooncake` connectors and the parallel-dispatch path. Deployments still on the deprecated `pd-profile-handler` see `pick_pd_profile` with `prefill_decode` / `decode_only` instead of the values above.
+One naming detail is worth knowing before searching Jaeger: the scorer span uses the plugin *type*, not its instance name, so a profile that configures the same scorer twice (for example two `endpoint-attribute-scorer` instances scoring different attributes) produces two identically-named `scorer.endpoint-attribute-scorer` spans, distinguishable only by the `llm_d.epp.scorer.name` attribute.
 
-One version caveat matters when reproducing this map. The scheduling spans (`run_scheduler_profile`, `filter_endpoints`, `llm_d.epp.scoring`, `llm_d.epp.scorer.<scorer type>`, `pick_endpoints`) and the KV index spans (`llm_d.kv_cache.index`, plus `.add` and `.evict`) landed in llm-d-router after its `v0.9.0` tag. Expect the index family to be split across two places in the backend: the lookup, and the `.add` that records the request's own blocks when speculative indexing is enabled, sit inside the request tree, while `.evict` is driven by background KV-event processing and therefore arrives as its own single-span trace rather than under any request. Since llm-d `v0.8.0` pins router `v0.9.0`, a deployment from that release shows a single `score_prefix_cache` span where the scoring subtree appears here. The guides on llm-d `main` take the chart default, the EPP's floating `main` tag, and that image does emit the full set. The gateway, disaggregation, and proxy spans are the same either way.
+Naming has now converged: every span name in llm-d-router is bare (`request`, `request_orchestration`, `filter_endpoints`, `scoring`, `scorer.<type>`, `pick_disagg_profile`, `index_lookup`, `prefill`, `decode`, the P/D proxy root `<METHOD> <path>`, …); component prefixes only remain on attributes (`llm_d.epp.*`, `llm_d.kv_cache.*`, `llm_d.pd_proxy.*`). The last holdouts, the `gateway.` prefix on the EPP root spans and the `llm_d.epp.`/`llm_d.pd_proxy.` prefixes on the scoring and P/D-proxy stage spans, were dropped in [llm-d-router#2557](https://github.com/llm-d/llm-d-router/pull/2557) and [llm-d-router#2558](https://github.com/llm-d/llm-d-router/pull/2558). The [tracing guide](/docs/operations/observability/tracing) is the source of truth if that changes again.
 
 On the KV-cache side, a wrapper such as `NewTracedIndex` keeps tracing orthogonal to the index implementation: business logic stays clean; span names and attributes stay consistent. That pattern, **instrumentation as a decorator**, is the preferred control-plane approach over copy-pasted `StartSpan` calls inside every algorithm.
 
 ### Attribute contract (what belongs on a span)
 
 ```text
-# KV index lookup (llm_d.kv_cache.index)
+# KV index lookup (index_lookup)
 llm_d.kv_cache.lookup.cache_hit = true
 llm_d.kv_cache.lookup.blocks_found = 48
 llm_d.kv_cache.index.lookup.block_count = 52
@@ -260,62 +262,22 @@ Span status follows a minimal convention: leave success as unset/default; set `E
 
 ## After: one request, one tree
 
-Here is one real request, captured end to end on a live P/D deployment and exported from Jaeger. This is the shape to recognize once E2E and fine-grained tracing are enabled. Durations below are as measured; attribute names are shortened to keep the tree readable:
+Here is one real request, captured end to end on a live P/D deployment and exported from Jaeger. This is the shape to recognize once E2E and fine-grained tracing are enabled:
 
 <div style={{textAlign: 'center', margin: '24px 0'}}>
   <img src="/img/blogs/distributed-tracing/figure6-trace-waterfall.png" alt="Jaeger waterfall of a real 25-span trace for a P/D disaggregated chat completion, spanning EPP, routing sidecar, and both vLLM engines" style={{width: '98%', height: 'auto'}} />
   <p style={{textAlign: 'center', fontSize: '0.9em', marginTop: '8px'}}><em><strong>FIGURE 6</strong>: A real 25-span trace for a single disaggregated chat completion (2,071 prompt tokens, 200 completion tokens) across four services. EPP tracing came from the router chart; the routing sidecar and both vLLM engines were wired by hand.</em></p>
 </div>
 
-```text
-gateway.request                                          3146ms
-├─ gateway.request_orchestration                        0.295ms
-│  ├─ pick_disagg_profile                               0.004ms
-│  │  attrs: llm_d.epp.profile_handler.decision=run_decode
-│  ├─ run_scheduler_profile                             0.036ms
-│  │  attrs: llm_d.epp.scheduling.profile.name=decode
-│  │  ├─ filter_endpoints                               0.007ms
-│  │  │  attrs: candidate_endpoints=3  filtered_endpoints=1
-│  │  ├─ llm_d.epp.scoring                              0.013ms
-│  │  │  └─ llm_d.epp.scorer.active-request-scorer      0.007ms
-│  │  │     attrs: score.max=1  endpoints_scored=1
-│  │  └─ pick_endpoints                                 0.006ms
-│  ├─ pick_disagg_profile                               0.003ms
-│  │  attrs: llm_d.epp.profile_handler.decision=run_prefill
-│  ├─ run_scheduler_profile                             0.029ms
-│  │  attrs: llm_d.epp.scheduling.profile.name=prefill
-│  │  ├─ filter_endpoints                               0.009ms
-│  │  ├─ llm_d.epp.scoring                              0.011ms
-│  │  │  └─ llm_d.epp.scorer.token-load-scorer          0.007ms
-│  │  └─ pick_endpoints                                 0.002ms
-│  ├─ pick_disagg_profile                               0.004ms
-│  │  attrs: llm_d.epp.profile_handler.decision=complete_prefill-decode
-│  ├─ prepare_disaggregation                            0.005ms
-│  └─ prepare_disaggregation                            0.002ms
-└─ llm_d.pd_proxy.POST /v1/chat/completions               3142ms
-   └─ forward_request                                     3142ms
-      └─ prefill                                          49.9ms
-         attrs: llm_d.pd_proxy.connector=nixlv2
-         ├─ HTTP POST (to the prefill pod)                49.8ms
-         │  └─ llm_request                                 47.7ms
-         │     attrs: gen_ai.usage.prompt_tokens=2071  completion_tokens=1
-         └─ decode                                         3092ms
-            attrs: llm_d.pd_proxy.true_ttft_ms=50
-            └─ HTTP POST (to the decode pod)               3092ms
-               └─ llm_request                              3091ms
-                  attrs: gen_ai.latency.time_to_first_token=0.343
-                         gen_ai.latency.time_in_queue=0.322
-```
-
-Three things in that capture are worth dwelling on, because they are easy to get wrong from a diagram alone.
+Three things in that capture are worth dwelling on, because they are easy to get wrong from the waterfall alone.
 
 **Routing is usually not where the time goes.** The entire EPP orchestration here, three profile decisions, two scheduler profiles, filtering, scoring, and picking, took 0.295ms out of 3146ms, so those scheduling spans are microsecond-scale. The exception worth knowing is the precise prefix-cache path, where the EPP calls the engine's render endpoint to tokenize the prompt before it can hash blocks: in a separate capture that single HTTP child accounted for 7.1ms of a 7.6ms orchestration. Still small against engine time, but no longer invisible. Either way, when a request is slow the trace tells you immediately whether to look downstream.
 
 **`decode` really is nested under `prefill`.** With the default `nixlv2` connector the decode span is started from the prefill span's context, so Jaeger renders it as a child rather than a sibling. This capture confirms it on `main`, and the same context reuse is present in `v0.9.0`. A prefill span reporting 49.9ms while containing a 3092ms child is that quirk, not a slow prefill. Read the stage durations from the attributes the proxy puts on the decode span, `llm_d.pd_proxy.prefill_duration_ms` and `llm_d.pd_proxy.decode_duration_ms`, rather than from the nesting.
 
-**Two TTFT numbers, two questions.** The coordinator recorded `llm_d.pd_proxy.true_ttft_ms = 50`, derived from the prefill leg, while the decode engine independently reported `gen_ai.latency.time_to_first_token = 0.343` with `gen_ai.latency.time_in_queue = 0.322`. Neither is wrong; they measure different things, and only a trace that carries both makes the difference legible. Also note the prefill engine's `completion_tokens = 1`: the prefill leg is sent with `max_tokens=1`, visible as `gen_ai.request.max_tokens` on that engine span, so prefill reports a single token while the decode engine reports the full 200.
+**Two TTFT numbers, two questions.** The P/D proxy sidecar recorded `llm_d.pd_proxy.true_ttft_ms = 50`, derived from the prefill leg, while the decode engine independently reported `gen_ai.latency.time_to_first_token = 0.343` with `gen_ai.latency.time_in_queue = 0.322`. Neither is wrong; they measure different things, and only a trace that carries both makes the difference legible. Also note the prefill engine's `completion_tokens = 1`: the prefill leg is sent with `max_tokens=1`, visible as `gen_ai.request.max_tokens` on that engine span, so prefill reports a single token while the decode engine reports the full 200.
 
-One deployment detail affects the root span. This capture ran the standalone `epponly` topology, where an Envoy sidecar fronts the EPP rather than a Kubernetes Gateway, and that proxy was not itself traced, so `gateway.request` is the root. Where the gateway is traced, or a payload processor runs ahead of the EPP, `gateway.request` becomes a child of that span instead.
+One deployment detail affects the root span. This capture ran the standalone `epponly` topology, where an Envoy sidecar fronts the EPP rather than a Kubernetes Gateway, and that proxy was not itself traced, so `request` is the root. Where the gateway is traced, or a payload processor runs ahead of the EPP, `request` becomes a child of that span instead.
 
 Compared with Figure 2: one ID, explicit parent/child edges, and attributes that explain **routing and P/D policy**, not only HTTP status codes.
 
@@ -335,7 +297,7 @@ Full steps live in the docs; the mental model is:
 
 1. **Install the telemetry plane:** OTel Collector + Jaeger (or another backend) via the observability recipes.  
 2. **Enable model-server tracing:** for vLLM, pass `--otlp-traces-endpoint`, add `--collect-detailed-traces all` if you want the queue and model-phase latencies used above, and set `OTEL_SERVICE_NAME` on the pod. The engine ships no service name of its own, so without it every engine span arrives as `unknown_service`, which reads like broken instrumentation rather than a missing variable.  
-3. **Enable EPP tracing:** one switch in the chart that deploys your EPP, either `inferenceExtension.tracing` in the GAIE values the tracing guide uses, or `router.tracing` in the llm-d-router chart. In the router chart that switch sets the EPP's `--tracing` flag along with its exporter, endpoint, and sampler, so nothing else is needed there.  
+3. **Enable EPP tracing:** one switch, `router.tracing`, in the llm-d-router chart that deploys your EPP. It sets the EPP's `--tracing` flag along with its exporter, endpoint, and sampler, so nothing else is needed there.
 4. **Wire the P/D routing sidecar yourself:** the EPP switch above does not reach it, and the shipped P/D model-server manifests carry no tracing configuration at all. That container needs `--tracing=true`, which defaults to false, *and* its own `OTEL_TRACES_EXPORTER=otlp` plus `OTEL_EXPORTER_OTLP_ENDPOINT`. Miss the flag and the proxy stages simply never appear; miss the exporter variable and the spans are pretty-printed to the pod's stdout instead, because the default exporter is `console`. Both failures look exactly like the dropped-header symptom above.  
 5. **Send one request, then open the UI:** confirm a multi-service tree, not orphan engine spans.  
 6. **Turn sampling down for production:** start near `0.1` unless actively debugging or soaking in staging. One trap here: `parentbased_traceidratio` is the only sampler the llm-d components accept. Any other value, including standard OpenTelemetry names like `parentbased_always_on`, logs an error and falls back to ratio `0.1`, as does a `OTEL_TRACES_SAMPLER_ARG` that fails to parse as a float. A debug run you believed captured everything then quietly keeps a tenth.
