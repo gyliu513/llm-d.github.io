@@ -2,7 +2,7 @@
 title: "Serving Moonshot AI's Kimi K3.1 Pro with llm-d across TPUs and GPUs"
 description: "Day-0 distributed serving recipes for Moonshot AI's 2.8T-parameter Kimi K3.1 Pro at 1M context using llm-d across Ironwood TPU v7x (SGLang) and NVIDIA GB300 GPUs (vLLM), on Google Cloud."
 slug: deploy-kimi-k3-1-pro-with-llm-d
-date: 2026-11-04T09:00
+date: 2026-11-12T09:00
 authors:
   - keelinmcdonell
   - ashokchandrasekar
